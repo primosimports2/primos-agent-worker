@@ -7,7 +7,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { z } from "zod";
 import { supabase } from "../supabase.js";
-import { AskHumanError, setProgress, uploadScreenshot } from "../runHelpers.js";
+import { AskHumanError, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
 const PROVIDER = (process.env.AGENT_PROVIDER || "openai").toLowerCase();
 
@@ -39,8 +39,9 @@ export type AgentOptions = {
   maxSteps?: number;
   /** Optional pre-authenticated page to reuse instead of opening a new one. */
   page?: Page;
+  /** Step index to start counting from (e.g. after deterministic preflight). */
+  startStepIndex?: number;
 };
-
 
 type ElementSnapshot = {
   ref: string;
@@ -143,22 +144,21 @@ export async function runLlmAgent(opts: AgentOptions): Promise<AgentResult> {
   for (const v of Object.values(opts.credentials)) SECRET_VALUES.add(v);
 
   const page = opts.page ?? (await opts.context.newPage());
-page.setDefaultTimeout(30_000);
+  page.setDefaultTimeout(30_000);
 
-// Race-free download capture
-let pendingDownload: Promise<Download> | null = null;
-const armDownload = () => {
-  pendingDownload = page.waitForEvent("download", { timeout: 120_000 }).catch(() => null as any);
-};
-armDownload();
+  // Race-free download capture
+  let pendingDownload: Promise<Download> | null = null;
+  const armDownload = () => {
+    pendingDownload = page.waitForEvent("download", { timeout: 120_000 }).catch(() => null as any);
+  };
+  armDownload();
 
-if (!opts.page) {
-  await setProgress(opts.runId, "navigating", `Opening ${opts.startUrl}`);
-  await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
-}
+  if (!opts.page) {
+    await setProgress(opts.runId, "navigating", `Opening ${opts.startUrl}`);
+    await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
+  }
 
-
-  let stepIndex = 0;
+  let stepIndex = opts.startStepIndex ?? 0;
   let downloadedFile: { filePath: string; filename: string } | null = null;
   const actionHistory: string[] = [];
 
@@ -273,10 +273,10 @@ Rules:
       },
     }),
     ask_human: tool({
-  description: "...",
-  inputSchema: z.object({ question: z.string(), keywords: z.array(z.string()).optional() }),
-  execute: async ({ question, keywords }): Promise<{ ok: boolean }> => {
-    throw new AskHumanError(question, { url: page.url() }, keywords ?? []);
+      description: "Pause the run and ask a human a question. Use only when you genuinely cannot proceed.",
+      inputSchema: z.object({ question: z.string(), keywords: z.array(z.string()).optional() }),
+      execute: async ({ question, keywords }) => {
+        throw new AskHumanError(question, { url: page.url() }, keywords ?? []);
       },
     }),
   };
@@ -294,6 +294,7 @@ Rules:
     const screenshot = await page.screenshot({ type: "jpeg", quality: 60 });
 
     await uploadScreenshot(opts.runId, page);
+    const stepShotUrl = await uploadStepScreenshot(opts.runId, page, stepIndex, "agent");
     await setProgress(opts.runId, "thinking", `Step ${stepIndex}: deciding next action`);
 
     const userMessage = `Current URL: ${url}
@@ -340,16 +341,17 @@ Decide the single best next action toward the goal.`;
         : "(no tool call)";
       actionHistory.push(summary);
 
+      const baseOutput = execResult ? JSON.parse(redact(JSON.stringify(execResult))) : {};
       await logStep(opts.runId, stepIndex, "action", {
         tool_name: toolCall?.name ?? null,
         tool_args: toolCall ? JSON.parse(redact(JSON.stringify(toolCall.args || {}))) : null,
-        output: execResult ? JSON.parse(redact(JSON.stringify(execResult))) : null,
+        output: { ...(baseOutput || {}), url, screenshot_url: stepShotUrl },
         reasoning: redact(assistantText).slice(0, 2000),
       });
     } catch (err) {
       if (err instanceof AskHumanError) throw err;
       const msg = (err as Error)?.message || String(err);
-      await logStep(opts.runId, stepIndex, "error", { reasoning: redact(msg).slice(0, 2000) });
+      await logStep(opts.runId, stepIndex, "error", { reasoning: redact(msg).slice(0, 2000), output: { url, screenshot_url: stepShotUrl, error: msg.slice(0, 500) } });
       // If the model misbehaves, give it one more chance
       if (i >= maxSteps - 1) throw err;
       continue;
