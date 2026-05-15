@@ -25,28 +25,34 @@ Stagehand setup, which couldn't run reliably inside Supabase's Deno runtime.
    folder. Railway auto-detects the `Dockerfile`.
 3. Add these environment variables (Settings → Variables):
 
-   | Variable | Value |
-   |---|---|
-   | `SUPABASE_URL` | `https://nspcypdvvplvyfsujzxk.supabase.co` |
-   | `SUPABASE_SERVICE_ROLE_KEY` | from Supabase project settings |
-   | `MEXCOR_USERNAME` | your Mexcor username |
-   | `MEXCOR_PASSWORD` | your Mexcor password |
-   | `MEXCOR_ACCOUNT_LABEL` | `Suppliers` (this is the fix for the login loop) |
-   | `USE_BROWSERBASE` | `false` (set to `true` to fall back to Browserbase) |
-   | `BROWSERBASE_API_KEY` | optional, only if `USE_BROWSERBASE=true` |
-   | `BROWSERBASE_PROJECT_ID` | optional, only if `USE_BROWSERBASE=true` |
+   | Variable | Required | Notes |
+   |---|---|---|
+   | `SUPABASE_URL` | yes | `https://nspcypdvvplvyfsujzxk.supabase.co` |
+   | `SUPABASE_SERVICE_ROLE_KEY` | yes | from Supabase project settings |
+   | `OPENAI_API_KEY` | yes (default) | **Your own** OpenAI key (`sk-...`) — used by the browser agent |
+   | `AGENT_MODEL` | optional | Defaults to `gpt-5.5` (or `gemini-2.5-pro` if provider=google) |
+   | `AGENT_PROVIDER` | optional | `openai` (default) or `google` |
+   | `GOOGLE_API_KEY` | only if `AGENT_PROVIDER=google` | **Your own** Gemini API key |
+   | `AGENT_MAX_STEPS` | optional | Defaults to `30` |
+   | `MEXCOR_USERNAME` | yes | your Mexcor username |
+   | `MEXCOR_PASSWORD` | yes | your Mexcor password |
+   | `MEXCOR_ACCOUNT_LABEL` | optional | `Suppliers` (this is the fix for the login loop) |
+   | `USE_BROWSERBASE` | optional | `false` by default; set to `true` to fall back to Browserbase |
+   | `BROWSERBASE_API_KEY` | optional | only if `USE_BROWSERBASE=true` |
+   | `BROWSERBASE_PROJECT_ID` | optional | only if `USE_BROWSERBASE=true` |
 
-4. Deploy. The container will boot, log
-   `[worker] worker-... starting (poll=5000ms)`, and start picking up runs.
+   The worker does **not** use Lovable AI Gateway. All LLM traffic goes through your own OpenAI (or Gemini) account, billed directly to you.
 
-That's it — there is no port to expose, no public URL needed. The worker
-talks to Supabase outbound only.
+## How the LLM browser agent works
 
-### Cost
+Instead of brittle hardcoded selectors, each step the worker:
+1. Takes a screenshot of the page.
+2. Extracts every visible interactable element with a stable `ref` (e1, e2, ...).
+3. Sends both to **your own OpenAI account** (default model `gpt-5.5`, override with `AGENT_MODEL`).
+4. The model returns one tool call: `click(ref)`, `fill(ref, credentialKey)`, `press`, `navigate`, `scroll`, `wait`, `download_complete`, or `ask_human`.
+5. Executes the action via Playwright, logs the reasoning + action into `distributor_agent_steps` (passwords redacted), and loops.
 
-Railway's smallest plan (~$5/month) is plenty for one worker handling a few
-runs an hour. Scale to multiple replicas later if needed; the `claim_next_...`
-RPC uses `FOR UPDATE SKIP LOCKED` so workers won't fight over runs.
+Credentials are passed via `credentialKey` so the model never echoes them.
 
 ## Local development
 
