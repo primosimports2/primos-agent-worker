@@ -67,13 +67,13 @@ async function loginAndPickAccount(
     await setProgress(runId, "selecting_account", `Selecting ${ACCOUNT_LABEL} account`);
 
     try {
-      await pickerSelect.selectOption({ label: ACCOUNT_LABEL, timeout: 5_000 });
+       await pickerSelect.selectOption({ label: ACCOUNT_LABEL }, { timeout: 5_000 });
     } catch {
       try {
         await pickerSelect.selectOption(
-          { label: new RegExp(ACCOUNT_LABEL, "i") as any },
-          { timeout: 5_000 },
-        );
+   { label: new RegExp(ACCOUNT_LABEL, "i") } as any,
+   { timeout: 5_000 },
+ );
       } catch {
         await pickerSelect.click({ timeout: 5_000 }).catch(() => {});
         const opt = page
