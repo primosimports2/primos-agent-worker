@@ -267,10 +267,10 @@ Rules:
       },
     }),
     ask_human: tool({
-      description: "Pause the run and ask a human a question. Use only when you genuinely cannot proceed.",
-      inputSchema: z.object({ question: z.string(), keywords: z.array(z.string()).optional() }),
-      execute: async ({ question, keywords }) => {
-        throw new AskHumanError(question, { url: page.url() }, keywords ?? []);
+  description: "...",
+  inputSchema: z.object({ question: z.string(), keywords: z.array(z.string()).optional() }),
+  execute: async ({ question, keywords }): Promise<{ ok: boolean }> => {
+    throw new AskHumanError(question, { url: page.url() }, keywords ?? []);
       },
     }),
   };
