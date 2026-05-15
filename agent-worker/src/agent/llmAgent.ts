@@ -37,7 +37,10 @@ export type AgentOptions = {
   credentials: Record<string, string>;
   learnings: { question: string; answer: string }[];
   maxSteps?: number;
+  /** Optional pre-authenticated page to reuse instead of opening a new one. */
+  page?: Page;
 };
+
 
 type ElementSnapshot = {
   ref: string;
@@ -139,18 +142,21 @@ export async function runLlmAgent(opts: AgentOptions): Promise<AgentResult> {
 
   for (const v of Object.values(opts.credentials)) SECRET_VALUES.add(v);
 
-  const page = await opts.context.newPage();
-  page.setDefaultTimeout(30_000);
+  const page = opts.page ?? (await opts.context.newPage());
+page.setDefaultTimeout(30_000);
 
-  // Race-free download capture
-  let pendingDownload: Promise<Download> | null = null;
-  const armDownload = () => {
-    pendingDownload = page.waitForEvent("download", { timeout: 120_000 }).catch(() => null as any);
-  };
-  armDownload();
+// Race-free download capture
+let pendingDownload: Promise<Download> | null = null;
+const armDownload = () => {
+  pendingDownload = page.waitForEvent("download", { timeout: 120_000 }).catch(() => null as any);
+};
+armDownload();
 
+if (!opts.page) {
   await setProgress(opts.runId, "navigating", `Opening ${opts.startUrl}`);
   await page.goto(opts.startUrl, { waitUntil: "domcontentloaded" });
+}
+
 
   let stepIndex = 0;
   let downloadedFile: { filePath: string; filename: string } | null = null;
