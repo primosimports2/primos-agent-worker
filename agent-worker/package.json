@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "playwright": "^1.49.1"
+    "playwright": "^1.60.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
