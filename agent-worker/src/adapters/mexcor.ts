@@ -96,7 +96,6 @@ try {
 } catch {
   if (await loginBtn.count()) {
     await loginBtn.click({ timeout: 10_000 });
-  }
   } else {
     await passField.press("Enter");
   }
