@@ -60,6 +60,36 @@ export function startScreenshotLoop(runId: string, page: Page) {
   return () => clearInterval(t);
 }
 
+/**
+ * Upload a per-step screenshot under a unique path so the UI can show a
+ * thumbnail strip of every step (including deterministic preflight steps).
+ * Returns the public URL or null on failure.
+ */
+export async function uploadStepScreenshot(
+  runId: string,
+  page: Page,
+  stepIndex: number,
+  label?: string,
+): Promise<string | null> {
+  try {
+    const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: false });
+    const safeLabel = (label || "step").replace(/[^a-z0-9_-]/gi, "_").slice(0, 24);
+    const path = `${runId}/steps/${String(stepIndex).padStart(4, "0")}-${safeLabel}.jpg`;
+    const { error } = await supabase.storage.from("agent-runs").upload(path, buf, {
+      contentType: "image/jpeg",
+      upsert: true,
+      cacheControl: "60",
+    });
+    if (error) {
+      console.warn("step screenshot upload error", error.message);
+      return null;
+    }
+    return supabase.storage.from("agent-runs").getPublicUrl(path).data.publicUrl;
+  } catch {
+    return null;
+  }
+}
+
 export async function logStep(
   runId: string,
   stepIndex: number,
