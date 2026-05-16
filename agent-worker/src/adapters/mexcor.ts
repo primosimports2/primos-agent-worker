@@ -2,7 +2,9 @@ import type { BrowserContext, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
-const LOGIN_URL = "https://encompass8.com/User/Login";
+ const LOGIN_URL =
+   process.env.MEXCOR_LOGIN_URL ||
+   "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
 const ACCOUNT_LABEL = process.env.MEXCOR_ACCOUNT_LABEL || "Suppliers";
 
 export type MexcorResult = { filePath: string; filename: string };
