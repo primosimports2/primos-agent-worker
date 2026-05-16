@@ -272,11 +272,13 @@ Rules:
         return { ok: true, note: `${reason} -> ${filename}` };
       },
     }),
-    ask_human: tool({
+        ask_human: tool({
       description: "Pause the run and ask a human a question. Use only when you genuinely cannot proceed.",
       inputSchema: z.object({ question: z.string(), keywords: z.array(z.string()).optional() }),
-      execute: async ({ question, keywords }) => {
+      execute: async ({ question, keywords }): Promise<{ ok: false; error: string }> => {
         throw new AskHumanError(question, { url: page.url() }, keywords ?? []);
+        // unreachable — satisfies AI SDK v5's return-type inference
+        return { ok: false, error: question };
       },
     }),
   };
