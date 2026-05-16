@@ -81,15 +81,22 @@ async function loginAndPickAccount(
   await snap("credentials_filled", "Filled username + password");
 
   const loginBtn = page.locator(
-    [
-      'button:has-text("Log in")',
-      'button:has-text("Login")',
-      'button:has-text("Sign in")',
-      'input[type="submit"]',
-    ].join(", "),
-  ).first();
+  [
+    'button:visible:has-text("Log in")',
+    'button:visible:has-text("Login")',
+    'button:visible:has-text("Sign in")',
+    'input[type="submit"]:visible:not(.HiddenSubmitButton)',
+    'input[type="button"][value*="Log" i]:visible',
+  ].join(", "),
+).first();
+
+// Encompass8 has a HiddenSubmitButton that traps clicks — always prefer Enter.
+try {
+  await passField.press("Enter");
+} catch {
   if (await loginBtn.count()) {
     await loginBtn.click({ timeout: 10_000 });
+  }
   } else {
     await passField.press("Enter");
   }
