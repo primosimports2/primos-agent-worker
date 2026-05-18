@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from "playwright";
+import type { BrowserContext, Locator, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
@@ -17,8 +17,6 @@ export type MexcorResult = { filePath: string; filename: string };
 
 /**
  * Deterministically log into Encompass8 / Mexcor and pick the right account.
- * Each phase logs a preflight step with a screenshot so the UI shows a
- * thumbnail strip of where login broke (if it did).
  */
 async function loginAndPickAccount(
   page: Page,
@@ -52,8 +50,7 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
-  // --- Find username field. Try named selectors first, then fall back to the
-  // first visible non-password text input on the page. ---
+  // --- Find username field ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -86,7 +83,7 @@ async function loginAndPickAccount(
   if (!visible) {
     await snap("login_form_missing", "Could not find a username input on the page");
     throw new Error(
-      "Mexcor login form did not appear (no username input found). Check screenshots — the page may be showing a maintenance page, captcha, or has changed structure.",
+      "Mexcor login form did not appear (no username input found).",
     );
   }
 
@@ -96,16 +93,20 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
-  // Encompass's canonical submit path is the HiddenSubmitButton shim wired to
-  // Enter in the password field. Press Enter first, then fall back to a STRICT
-  // form-scoped submit button.
+  // --- Submit (Enter, fallback to strict form-scoped submit button) ---
   const confirmBtnEarly = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
   const passwordHidden = () =>
     page.locator('input[type="password"]').first().waitFor({ state: "hidden", timeout: 15_000 });
+  const accountFieldEarly = page
+    .locator('input[value*="Vendors" i], input[value*="Suppliers" i], input[readonly], .k-input')
+    .first();
   const pickerVisible = () =>
-    confirmBtnEarly.waitFor({ state: "visible", timeout: 15_000 });
+    Promise.race([
+      confirmBtnEarly.waitFor({ state: "visible", timeout: 15_000 }),
+      accountFieldEarly.waitFor({ state: "visible", timeout: 15_000 }),
+    ]);
   const urlChanged = () =>
     page.waitForURL((u) => !u.toString().includes("DashboardID=100008"), { timeout: 15_000 });
 
@@ -181,21 +182,14 @@ async function loginAndPickAccount(
     validation_text: validationText ? validationText.slice(0, 200) : null,
   });
 
-   // --- Account picker (Vendors -> Suppliers) ---
-  // After login, Encompass8 lands on a page that shows the CURRENTLY selected
-  // account in a Kendo combobox, e.g. "maxstrygler@ (Vendors (AP Contact))".
-  // There is NO visible dropdown list until we click that field. The picker is
-  // basically invisible from a selector POV — we just have to find any element
-  // whose value/text looks like "<something>@... Vendors" and click it.
-  //
-  // This block is intentionally aggressive: it polls the whole page (not just
-  // a Logon dialog), and if nothing matches it still tries one broad fallback
-  // before giving up. It must NEVER silently skip.
-
-  const VENDORS_RE = /@.*vendors|vendors.*\(ap|vendors\s*\(/i;
+  // --- Account picker (Vendors -> Suppliers) ---
+  // After login, Encompass8 shows the CURRENTLY selected account in a Kendo
+  // combobox, e.g. "maxstrygler@ (Vendors (AP Contact))". There is NO visible
+  // dropdown list until we click that field. We poll the whole page for any
+  // element whose value/text matches "@... Vendors" and click it.
+  const VENDORS_RE = /@.*vendors|vendors\s*\(/i;
 
   const findVendorsField = async (): Promise<Locator | null> => {
-    // 1) Inputs whose value mentions Vendors / @
     const inputs = page.locator('input:visible');
     const inputCount = await inputs.count().catch(() => 0);
     for (let i = 0; i < inputCount; i++) {
@@ -203,7 +197,6 @@ async function loginAndPickAccount(
       const v = await el.inputValue().catch(() => "");
       if (v && (VENDORS_RE.test(v) || /vendors/i.test(v))) return el;
     }
-    // 2) Any visible element whose text mentions Vendors (the combobox face).
     const textCandidates = page.locator(
       'span:visible, div:visible, .k-input:visible, .k-input-inner:visible, [role="combobox"]:visible',
     );
@@ -216,7 +209,6 @@ async function loginAndPickAccount(
     return null;
   };
 
-  // Poll up to 20s for the Vendors field to appear after login.
   let vendorsField: Locator | null = null;
   const pollStart = Date.now();
   while (Date.now() - pollStart < 20_000) {
@@ -228,9 +220,8 @@ async function loginAndPickAccount(
   if (!vendorsField) {
     await snap(
       "account_picker_not_found",
-      "No element containing '@... Vendors' was visible after login — attempting blind fallback click on any Kendo combobox",
+      "No element containing '@... Vendors' was visible — attempting blind fallback click on any Kendo combobox",
     );
-    // Last-ditch: click the first visible Kendo combobox / dropdown trigger.
     const blindTriggers = [
       '.k-dropdown-wrap',
       '.k-dropdownlist',
@@ -247,8 +238,6 @@ async function loginAndPickAccount(
     }
   } else {
     await snap("account_picker_detected", "Found Vendors field — clicking it to open dropdown");
-    // Click the field itself, then walk up to common Kendo wrappers in case the
-    // field is a readonly input that doesn't open on direct click.
     const clickTargets: Locator[] = [
       vendorsField,
       vendorsField.locator(
@@ -270,7 +259,6 @@ async function loginAndPickAccount(
       }
     }
     if (!opened) {
-      // Force click bypassing visibility checks.
       await vendorsField.click({ force: true, timeout: 3_000 }).catch(() => {});
     }
   }
@@ -278,7 +266,6 @@ async function loginAndPickAccount(
   await page.waitForTimeout(700);
   await snap("picker_opened", `Looking for ${ACCOUNT_LABEL} option in opened dropdown`);
 
-  // Select the Suppliers option from whatever list opened.
   const optionSelectors = [
     '.k-list-item',
     '.k-item',
@@ -321,7 +308,6 @@ async function loginAndPickAccount(
 
   await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
 
-  // Click Confirm if present (some flows auto-submit on select).
   const confirmBtn = page.locator(
     [
       'input[type="submit"][value="Confirm" i]',
@@ -341,3 +327,70 @@ async function loginAndPickAccount(
   }
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
+
+  // --- Sanity check: still on login? ---
+  const passStillVisible = await page
+    .locator('input[type="password"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
+  const postLoginHint = await page
+    .locator(
+      '[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
+    )
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (passStillVisible && !urlLooksLoggedIn && !postLoginHint) {
+    await snap("login_failed", "Password field still visible and no post-login UI detected", {
+      url_looks_logged_in: urlLooksLoggedIn,
+      post_login_hint: postLoginHint,
+    });
+    throw new Error(
+      `Mexcor login appears to have failed (adapter ${MEXCOR_ADAPTER_VERSION}) — still on the login form after submit.`,
+    );
+  }
+
+  await setProgress(runId, "authenticated", "Logged in, locating sales report");
+  await snap("authenticated", "Reached post-login dashboard");
+  return preflightStep;
+}
+
+export async function runMexcor(
+  context: BrowserContext,
+  runId: string,
+  learnings: { question: string; answer: string }[],
+): Promise<MexcorResult> {
+  const username = process.env.MEXCOR_USERNAME;
+  const password = process.env.MEXCOR_PASSWORD;
+  if (!username || !password) {
+    throw new Error("MEXCOR_USERNAME / MEXCOR_PASSWORD missing on worker");
+  }
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(30_000);
+  const lastPreflightStep = await loginAndPickAccount(page, username, password, runId);
+
+  const goal = `You are already logged into the Mexcor / Encompass8 supplier portal as the "${ACCOUNT_LABEL}" account. Do NOT try to log in again — the username/password fields will not appear, and if they do, it means the session was lost (call ask_human instead of refilling).
+
+Your only job: find the latest sales report and download it as XLSX.
+
+Steps:
+1. Navigate using the left sidebar / top menu. Look for items like "Sales", "Sales Comparison", "Reports", "Sales Report", or "Order Management".
+2. Open the most recent / current period report (use defaults if a date range is requested).
+3. Find an export action (Export, Download, Excel, XLSX) and click it. The download will be captured automatically — call download_complete right after you trigger it.`;
+
+  return runLlmAgent({
+    context,
+    runId,
+    goal,
+    startUrl: page.url(),
+    page,
+    credentials: {},
+    learnings,
+    maxSteps: Number(process.env.AGENT_MAX_STEPS || 30),
+    startStepIndex: lastPreflightStep,
+  });
+}
