@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v6-aggressive-vendors-click";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v7-verify-suppliers-confirm";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -17,6 +17,8 @@ export type MexcorResult = { filePath: string; filename: string };
 
 /**
  * Deterministically log into Encompass8 / Mexcor and pick the right account.
+ * Each phase logs a preflight step with a screenshot so the UI shows a
+ * thumbnail strip of where login broke (if it did).
  */
 async function loginAndPickAccount(
   page: Page,
@@ -50,7 +52,8 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
-  // --- Find username field ---
+  // --- Find username field. Try named selectors first, then fall back to the
+  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -83,7 +86,7 @@ async function loginAndPickAccount(
   if (!visible) {
     await snap("login_form_missing", "Could not find a username input on the page");
     throw new Error(
-      "Mexcor login form did not appear (no username input found).",
+      "Mexcor login form did not appear (no username input found). Check screenshots — the page may be showing a maintenance page, captcha, or has changed structure.",
     );
   }
 
@@ -93,7 +96,6 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
-  // --- Submit (Enter, fallback to strict form-scoped submit button) ---
   const confirmBtnEarly = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
@@ -167,7 +169,9 @@ async function loginAndPickAccount(
     .catch(() => false);
   const pickerVisibleNow = await confirmBtnEarly.isVisible().catch(() => false);
   const validationText = await page
-    .locator('text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i')
+    .locator(
+      'text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i',
+    )
     .first()
     .innerText({ timeout: 1_000 })
     .catch(() => "");
@@ -183,10 +187,6 @@ async function loginAndPickAccount(
   });
 
   // --- Account picker (Vendors -> Suppliers) ---
-  // After login, Encompass8 shows the CURRENTLY selected account in a Kendo
-  // combobox, e.g. "maxstrygler@ (Vendors (AP Contact))". There is NO visible
-  // dropdown list until we click that field. We poll the whole page for any
-  // element whose value/text matches "@... Vendors" and click it.
   const VENDORS_RE = /@.*vendors|vendors\s*\(/i;
 
   const findVendorsField = async (): Promise<Locator | null> => {
@@ -278,7 +278,7 @@ async function loginAndPickAccount(
 
   const supplierOption = page
     .locator(optionSelectors)
-    .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
+    .filter({ hasText: new RegExp(`\\b${ACCOUNT_LABEL}\\b`, "i") })
     .first();
 
   let optionClicked = false;
@@ -288,11 +288,8 @@ async function loginAndPickAccount(
     optionClicked = true;
   } catch {
     try {
-      await page
-        .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
-        .filter({ hasNot: page.locator('button, [role="button"], input') })
-        .first()
-        .click({ timeout: 5_000 });
+      const supplierText = page.locator(`text=/^\\s*${ACCOUNT_LABEL}\\s*$/i`).first();
+      await supplierText.click({ timeout: 5_000 });
       optionClicked = true;
     } catch {
       /* fall through */
@@ -307,6 +304,27 @@ async function loginAndPickAccount(
   }
 
   await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
+
+  const suppliersSelected = await page
+    .locator('input:visible, span:visible, div:visible, [role="combobox"]:visible, .k-input:visible, .k-input-inner:visible')
+    .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
+    .first()
+    .waitFor({ state: "visible", timeout: 5_000 })
+    .then(() => true)
+    .catch(async () => {
+      const inputs = page.locator('input:visible');
+      const count = await inputs.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const value = await inputs.nth(i).inputValue().catch(() => "");
+        if (new RegExp(ACCOUNT_LABEL, "i").test(value)) return true;
+      }
+      return false;
+    });
+
+  if (!suppliersSelected) {
+    await snap("picker_selection_unverified", `${ACCOUNT_LABEL} was clicked, but the account field did not visibly change`);
+    throw new Error(`Mexcor account picker: clicked ${ACCOUNT_LABEL}, but could not verify it was selected.`);
+  }
 
   const confirmBtn = page.locator(
     [
@@ -347,9 +365,11 @@ async function loginAndPickAccount(
     await snap("login_failed", "Password field still visible and no post-login UI detected", {
       url_looks_logged_in: urlLooksLoggedIn,
       post_login_hint: postLoginHint,
+      account_confirmed: true,
     });
-    throw new Error(
-      `Mexcor login appears to have failed (adapter ${MEXCOR_ADAPTER_VERSION}) — still on the login form after submit.`,
+    await snap(
+      "continuing_after_account_confirm",
+      "Account was confirmed; continuing even though the hidden/background password field is still detectable",
     );
   }
 
