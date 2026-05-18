@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v4-picker-required";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v6-aggressive-vendors-click";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -181,11 +181,147 @@ async function loginAndPickAccount(
     validation_text: validationText ? validationText.slice(0, 200) : null,
   });
 
-  // --- Account picker (Vendors / Suppliers) ---
-  // Encompass renders a Kendo dialog ("Logon") with a custom combobox showing
-  // the currently selected account. We MUST click the combobox to open the
-  // list, pick Suppliers, then click Confirm. Skipping this leaves the worker
-  // authenticated as the wrong account.
+   // --- Account picker (Vendors -> Suppliers) ---
+  // After login, Encompass8 lands on a page that shows the CURRENTLY selected
+  // account in a Kendo combobox, e.g. "maxstrygler@ (Vendors (AP Contact))".
+  // There is NO visible dropdown list until we click that field. The picker is
+  // basically invisible from a selector POV — we just have to find any element
+  // whose value/text looks like "<something>@... Vendors" and click it.
+  //
+  // This block is intentionally aggressive: it polls the whole page (not just
+  // a Logon dialog), and if nothing matches it still tries one broad fallback
+  // before giving up. It must NEVER silently skip.
+
+  const VENDORS_RE = /@.*vendors|vendors.*\(ap|vendors\s*\(/i;
+
+  const findVendorsField = async (): Promise<Locator | null> => {
+    // 1) Inputs whose value mentions Vendors / @
+    const inputs = page.locator('input:visible');
+    const inputCount = await inputs.count().catch(() => 0);
+    for (let i = 0; i < inputCount; i++) {
+      const el = inputs.nth(i);
+      const v = await el.inputValue().catch(() => "");
+      if (v && (VENDORS_RE.test(v) || /vendors/i.test(v))) return el;
+    }
+    // 2) Any visible element whose text mentions Vendors (the combobox face).
+    const textCandidates = page.locator(
+      'span:visible, div:visible, .k-input:visible, .k-input-inner:visible, [role="combobox"]:visible',
+    );
+    const tCount = await textCandidates.count().catch(() => 0);
+    for (let i = 0; i < Math.min(tCount, 400); i++) {
+      const el = textCandidates.nth(i);
+      const t = (await el.innerText().catch(() => "")) || "";
+      if (VENDORS_RE.test(t) || /\bVendors\b/.test(t)) return el;
+    }
+    return null;
+  };
+
+  // Poll up to 20s for the Vendors field to appear after login.
+  let vendorsField: Locator | null = null;
+  const pollStart = Date.now();
+  while (Date.now() - pollStart < 20_000) {
+    vendorsField = await findVendorsField();
+    if (vendorsField) break;
+    await page.waitForTimeout(500);
+  }
+
+  if (!vendorsField) {
+    await snap(
+      "account_picker_not_found",
+      "No element containing '@... Vendors' was visible after login — attempting blind fallback click on any Kendo combobox",
+    );
+    // Last-ditch: click the first visible Kendo combobox / dropdown trigger.
+    const blindTriggers = [
+      '.k-dropdown-wrap',
+      '.k-dropdownlist',
+      '[aria-haspopup="listbox"]',
+      '[role="combobox"]',
+      '.k-input-inner',
+    ];
+    for (const sel of blindTriggers) {
+      const t = page.locator(sel).first();
+      if (await t.isVisible().catch(() => false)) {
+        await t.click({ timeout: 3_000 }).catch(() => {});
+        break;
+      }
+    }
+  } else {
+    await snap("account_picker_detected", "Found Vendors field — clicking it to open dropdown");
+    // Click the field itself, then walk up to common Kendo wrappers in case the
+    // field is a readonly input that doesn't open on direct click.
+    const clickTargets: Locator[] = [
+      vendorsField,
+      vendorsField.locator(
+        'xpath=ancestor::*[contains(@class,"k-dropdown") or contains(@class,"k-picker") or contains(@class,"k-dropdownlist") or @role="combobox" or @aria-haspopup="listbox"][1]',
+      ),
+      vendorsField.locator('xpath=ancestor::*[contains(@class,"k-widget") or contains(@class,"k-input")][1]'),
+      vendorsField.locator('xpath=following-sibling::*[1]'),
+    ];
+    let opened = false;
+    for (const t of clickTargets) {
+      if (await t.isVisible().catch(() => false)) {
+        try {
+          await t.click({ timeout: 3_000 });
+          opened = true;
+          break;
+        } catch {
+          /* try next */
+        }
+      }
+    }
+    if (!opened) {
+      // Force click bypassing visibility checks.
+      await vendorsField.click({ force: true, timeout: 3_000 }).catch(() => {});
+    }
+  }
+
+  await page.waitForTimeout(700);
+  await snap("picker_opened", `Looking for ${ACCOUNT_LABEL} option in opened dropdown`);
+
+  // Select the Suppliers option from whatever list opened.
+  const optionSelectors = [
+    '.k-list-item',
+    '.k-item',
+    'li[role="option"]',
+    '[role="option"]',
+    '.dropdown-item',
+    'li',
+    'option',
+  ].join(", ");
+
+  const supplierOption = page
+    .locator(optionSelectors)
+    .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
+    .first();
+
+  let optionClicked = false;
+  try {
+    await supplierOption.waitFor({ state: "visible", timeout: 7_000 });
+    await supplierOption.click({ timeout: 5_000 });
+    optionClicked = true;
+  } catch {
+    try {
+      await page
+        .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
+        .filter({ hasNot: page.locator('button, [role="button"], input') })
+        .first()
+        .click({ timeout: 5_000 });
+      optionClicked = true;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  if (!optionClicked) {
+    await snap("picker_option_missing", `Could not click ${ACCOUNT_LABEL} option after opening dropdown`);
+    throw new Error(
+      `Mexcor account picker: ${ACCOUNT_LABEL} option not found / not clickable in dropdown.`,
+    );
+  }
+
+  await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
+
+  // Click Confirm if present (some flows auto-submit on select).
   const confirmBtn = page.locator(
     [
       'input[type="submit"][value="Confirm" i]',
@@ -194,204 +330,14 @@ async function loginAndPickAccount(
     ].join(", "),
   ).first();
 
-  const pickerDetector = page.locator(
-    [
-      'input[type="submit"][value="Confirm" i]',
-      'button:has-text("Confirm")',
-      '.k-window-title:has-text("Logon")',
-      'text=/multiple accounts on this site/i',
-    ].join(", "),
-  ).first();
-
-  const sawPicker = await pickerDetector
-    .waitFor({ state: "visible", timeout: 15_000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!sawPicker) {
-    await snap("account_picker_skipped", "No account picker detected after login", {
-      picker_present: false,
-    });
-  } else {
-    await snap("account_picker_detected", `Account picker visible — selecting ${ACCOUNT_LABEL}`, {
-      picker_present: true,
-    });
-
-    // Strategy 1: native <select>
-    const nativeSelect = page.locator(
-      'select:has(option:text-matches("Suppliers|Vendors", "i"))',
-    ).first();
-    let selected = false;
-    if (await nativeSelect.count()) {
-      try {
-        await nativeSelect.selectOption({ label: new RegExp(ACCOUNT_LABEL, "i") } as any, {
-          timeout: 3_000,
-        });
-        selected = true;
-      } catch {
-        /* fall through */
-      }
-    }
-
-    // Strategy 2: Kendo / custom combobox
-    if (!selected) {
-      const triggerCandidates = [
-        '.k-window:has-text("Logon") .k-dropdown-wrap',
-        '.k-window:has-text("Logon") .k-dropdownlist',
-        '.k-window:has-text("Logon") [aria-haspopup="listbox"]',
-        '.k-window:has-text("Logon") [role="combobox"]',
-        '.k-window:has-text("Logon") input[readonly]',
-        '.k-dropdown-wrap',
-        '.k-dropdownlist',
-        '[aria-haspopup="listbox"]',
-        '[role="combobox"]',
-        'input[readonly]',
-        '.dropdown-toggle, [data-toggle="dropdown"]',
-      ];
-
-      let triggerClicked = false;
-      for (const sel of triggerCandidates) {
-        const trig = page.locator(sel).first();
-        if (await trig.isVisible().catch(() => false)) {
-          try {
-            await trig.click({ timeout: 3_000 });
-            triggerClicked = true;
-            break;
-          } catch {
-            /* try next */
-          }
-        }
-      }
-
-      if (!triggerClicked) {
-        await snap("picker_trigger_missing", "Could not find a visible combobox trigger");
-        throw new Error(
-          "Mexcor account picker: no visible dropdown trigger found inside the Logon dialog.",
-        );
-      }
-
-      await page.waitForTimeout(500);
-      await snap("picker_opened", `Clicked picker trigger — looking for ${ACCOUNT_LABEL} option`);
-
-      const optionSelectors = [
-        '.k-list-item',
-        '.k-item',
-        'li[role="option"]',
-        '[role="option"]',
-        '.dropdown-item',
-        'li',
-        'option',
-      ].join(", ");
-
-      const supplierOption = page
-        .locator(optionSelectors)
-        .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
-        .first();
-
-      let optionClicked = false;
-      try {
-        await supplierOption.waitFor({ state: "visible", timeout: 5_000 });
-        await supplierOption.click({ timeout: 5_000 });
-        optionClicked = true;
-      } catch {
-        try {
-          await page
-            .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
-            .filter({ hasNot: page.locator('button, [role="button"], input') })
-            .first()
-            .click({ timeout: 5_000 });
-          optionClicked = true;
-        } catch {
-          /* fail below */
-        }
-      }
-
-      if (!optionClicked) {
-        await snap("picker_option_missing", `Could not click ${ACCOUNT_LABEL} option in dropdown`);
-        throw new Error(
-          `Mexcor account picker: ${ACCOUNT_LABEL} option not found / not clickable in dropdown.`,
-        );
-      }
-
-      await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
-    }
-
-    // Click Confirm and wait for the dialog to close.
+  if (await confirmBtn.isVisible().catch(() => false)) {
     try {
-      await confirmBtn.waitFor({ state: "visible", timeout: 10_000 });
       await confirmBtn.click({ timeout: 10_000 });
+      await confirmBtn.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
     } catch (err) {
       await snap("confirm_click_failed", `Failed to click Confirm: ${(err as Error).message}`);
       throw new Error("Mexcor account picker: failed to click Confirm button.");
     }
-    await confirmBtn.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
-    await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-    await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
-
-  // --- Sanity check: still on login? ---
-  const passStillVisible = await page
-    .locator('input[type="password"]')
-    .first()
-    .isVisible()
-    .catch(() => false);
-  const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
-  const postLoginHint = await page
-    .locator(
-      '[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
-    )
-    .first()
-    .isVisible()
-    .catch(() => false);
-
-  if (passStillVisible && !urlLooksLoggedIn && !postLoginHint) {
-    await snap("login_failed", "Password field still visible and no post-login UI detected", {
-      url_looks_logged_in: urlLooksLoggedIn,
-      post_login_hint: postLoginHint,
-    });
-    throw new Error(
-      `Mexcor login appears to have failed (adapter ${MEXCOR_ADAPTER_VERSION}) — still on the login form after submit. Check MEXCOR_USERNAME/MEXCOR_PASSWORD and MEXCOR_ACCOUNT_LABEL, or whether the Encompass page layout changed.`,
-    );
-  }
-
-  await setProgress(runId, "authenticated", "Logged in, locating sales report");
-  await snap("authenticated", "Reached post-login dashboard");
-  return preflightStep;
-}
-
-export async function runMexcor(
-  context: BrowserContext,
-  runId: string,
-  learnings: { question: string; answer: string }[],
-): Promise<MexcorResult> {
-  const username = process.env.MEXCOR_USERNAME;
-  const password = process.env.MEXCOR_PASSWORD;
-  if (!username || !password) {
-    throw new Error("MEXCOR_USERNAME / MEXCOR_PASSWORD missing on worker");
-  }
-
-  const page = await context.newPage();
-  page.setDefaultTimeout(30_000);
-  const lastPreflightStep = await loginAndPickAccount(page, username, password, runId);
-
-  const goal = `You are already logged into the Mexcor / Encompass8 supplier portal as the "${ACCOUNT_LABEL}" account. Do NOT try to log in again — the username/password fields will not appear, and if they do, it means the session was lost (call ask_human instead of refilling).
-
-Your only job: find the latest sales report and download it as XLSX.
-
-Steps:
-1. Navigate using the left sidebar / top menu. Look for items like "Sales", "Sales Comparison", "Reports", "Sales Report", or "Order Management".
-2. Open the most recent / current period report (use defaults if a date range is requested).
-3. Find an export action (Export, Download, Excel, XLSX) and click it. The download will be captured automatically — call download_complete right after you trigger it.`;
-
-  return runLlmAgent({
-    context,
-    runId,
-    goal,
-    startUrl: page.url(),
-    page,
-    credentials: {},
-    learnings,
-    maxSteps: Number(process.env.AGENT_MAX_STEPS || 30),
-    startStepIndex: lastPreflightStep,
-  });
-}
+  await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+  await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
