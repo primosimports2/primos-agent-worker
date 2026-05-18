@@ -2,9 +2,9 @@ import type { BrowserContext, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
- const LOGIN_URL =
-   process.env.MEXCOR_LOGIN_URL ||
-   "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
+const LOGIN_URL =
+  process.env.MEXCOR_LOGIN_URL ||
+  "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
 const ACCOUNT_LABEL = process.env.MEXCOR_ACCOUNT_LABEL || "Suppliers";
 
 export type MexcorResult = { filePath: string; filename: string };
@@ -56,7 +56,6 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
-    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -80,25 +79,26 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
+  // Encompass8 ships a hidden off-screen submit button (HiddenSubmitButton)
+  // that traps clicks forever. Exclude it and prefer pressing Enter.
   const loginBtn = page.locator(
-  [
-    'button:visible:has-text("Log in")',
-    'button:visible:has-text("Login")',
-    'button:visible:has-text("Sign in")',
-    'input[type="submit"]:visible:not(.HiddenSubmitButton)',
-    'input[type="button"][value*="Log" i]:visible',
-  ].join(", "),
-).first();
+    [
+      'button:visible:has-text("Log in")',
+      'button:visible:has-text("Login")',
+      'button:visible:has-text("Sign in")',
+      'input[type="submit"]:visible:not(.HiddenSubmitButton)',
+      'input[type="button"][value*="Log" i]:visible',
+    ].join(", "),
+  ).first();
 
-// Encompass8 has a HiddenSubmitButton that traps clicks — always prefer Enter.
-try {
-  await passField.press("Enter");
-} catch {
-  if (await loginBtn.count()) {
-    await loginBtn.click({ timeout: 10_000 });
- } } else {
+  try {
     await passField.press("Enter");
+  } catch {
+    if (await loginBtn.count()) {
+      await loginBtn.click({ timeout: 10_000 });
+    }
   }
+
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("submitted_login", "Submitted login form");
 
@@ -196,5 +196,4 @@ Steps:
     maxSteps: Number(process.env.AGENT_MAX_STEPS || 30),
     startStepIndex: lastPreflightStep,
   });
-}
 }
