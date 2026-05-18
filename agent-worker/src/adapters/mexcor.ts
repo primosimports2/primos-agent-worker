@@ -2,7 +2,9 @@ import type { BrowserContext, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
-const LOGIN_URL = "https://encompass8.com/User/Login";
+const LOGIN_URL =
+  process.env.MEXCOR_LOGIN_URL ||
+  "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
 const ACCOUNT_LABEL = process.env.MEXCOR_ACCOUNT_LABEL || "Suppliers";
 
 export type MexcorResult = { filePath: string; filename: string };
@@ -33,8 +35,6 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
-  // --- Find username field. Try named selectors first, then fall back to the
-  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -54,7 +54,6 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
-    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -95,15 +94,10 @@ async function loginAndPickAccount(
   await snap("submitted_login", "Submitted login form");
 
   // --- Account picker (Vendors / Suppliers) ---
-  // Encompass renders this as a custom combobox: a visible trigger (showing the
-  // currently selected account like "Vendors (AP Contact)") that must be CLICKED
-  // to reveal the list of accounts. A hidden native <select> may also exist.
   const confirmBtn = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
 
-  // Detect the picker by looking for either the Confirm button OR a visible
-  // element containing "Vendors" / account text inside the Logon dialog.
   const sawPicker = await confirmBtn
     .waitFor({ state: "visible", timeout: 10_000 })
     .then(() => true)
@@ -112,7 +106,6 @@ async function loginAndPickAccount(
   if (sawPicker) {
     await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
 
-    // Strategy 1: try the native <select> path (in case Encompass serves a real select).
     const nativeSelect = page.locator(
       'select:has(option:text-matches("Suppliers|Vendors", "i"))',
     ).first();
@@ -124,18 +117,16 @@ async function loginAndPickAccount(
         });
         selected = true;
       } catch {
-        // fall through to combobox path
+        // fall through
       }
     }
 
-    // Strategy 2: custom combobox — click the visible trigger, then pick option.
     if (!selected) {
       const triggerCandidates = [
         '[role="combobox"]',
         'input[readonly]',
-        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap', // Kendo UI (common in Encompass)
+        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap',
         '.dropdown-toggle, [data-toggle="dropdown"]',
-        // last-ditch: any visible element in the dialog containing "Vendors"
         'text=/Vendors/i',
       ];
 
@@ -169,7 +160,6 @@ async function loginAndPickAccount(
         .filter({ has: page.locator(':scope:visible') })
         .first();
 
-      // Fallback locator if the :visible filter doesn't match
       const suppliersOptionLoose = page
         .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
         .filter({ hasNot: page.locator('button, [role="button"]') })
@@ -191,7 +181,6 @@ async function loginAndPickAccount(
     await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
 
-  // --- Sanity check: still on login? ---
   const stillOnLogin = await page
     .locator('input[type="password"]')
     .first()
