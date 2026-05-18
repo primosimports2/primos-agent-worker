@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v7-verify-suppliers-confirm";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v8-native-select-suppliers-row";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -17,8 +17,6 @@ export type MexcorResult = { filePath: string; filename: string };
 
 /**
  * Deterministically log into Encompass8 / Mexcor and pick the right account.
- * Each phase logs a preflight step with a screenshot so the UI shows a
- * thumbnail strip of where login broke (if it did).
  */
 async function loginAndPickAccount(
   page: Page,
@@ -52,8 +50,6 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
-  // --- Find username field. Try named selectors first, then fall back to the
-  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -86,7 +82,7 @@ async function loginAndPickAccount(
   if (!visible) {
     await snap("login_form_missing", "Could not find a username input on the page");
     throw new Error(
-      "Mexcor login form did not appear (no username input found). Check screenshots — the page may be showing a maintenance page, captcha, or has changed structure.",
+      "Mexcor login form did not appear (no username input found).",
     );
   }
 
@@ -169,9 +165,7 @@ async function loginAndPickAccount(
     .catch(() => false);
   const pickerVisibleNow = await confirmBtnEarly.isVisible().catch(() => false);
   const validationText = await page
-    .locator(
-      'text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i',
-    )
+    .locator('text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i')
     .first()
     .innerText({ timeout: 1_000 })
     .catch(() => "");
@@ -190,6 +184,17 @@ async function loginAndPickAccount(
   const VENDORS_RE = /@.*vendors|vendors\s*\(/i;
 
   const findVendorsField = async (): Promise<Locator | null> => {
+    const selects = page.locator('select:visible');
+    const selectCount = await selects.count().catch(() => 0);
+    for (let i = 0; i < selectCount; i++) {
+      const el = selects.nth(i);
+      const selectedText = await el.evaluate((node: HTMLSelectElement) => {
+        const selected = node.selectedOptions?.[0];
+        return selected?.textContent || node.textContent || "";
+      }).catch(() => "");
+      if (VENDORS_RE.test(selectedText) || /vendors/i.test(selectedText)) return el;
+    }
+
     const inputs = page.locator('input:visible');
     const inputCount = await inputs.count().catch(() => 0);
     for (let i = 0; i < inputCount; i++) {
@@ -266,6 +271,37 @@ async function loginAndPickAccount(
   await page.waitForTimeout(700);
   await snap("picker_opened", `Looking for ${ACCOUNT_LABEL} option in opened dropdown`);
 
+  const selectSupplierFromNativeSelect = async (): Promise<boolean> => {
+    const selects = page.locator('select:visible');
+    const count = await selects.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const select = selects.nth(i);
+      const optionData = await select.evaluate((node: HTMLSelectElement, label) => {
+        const options = Array.from(node.options || []);
+        const matchIndex = options.findIndex((option) =>
+          (option.textContent || "").toLowerCase().includes(String(label).toLowerCase()),
+        );
+        if (matchIndex < 0) return null;
+        return { index: matchIndex, value: options[matchIndex].value, text: options[matchIndex].textContent || "" };
+      }, ACCOUNT_LABEL).catch(() => null);
+
+      if (!optionData) continue;
+
+      try {
+        await select.selectOption({ index: optionData.index }, { timeout: 5_000 });
+        await select.evaluate((node: HTMLSelectElement) => {
+          node.dispatchEvent(new Event("input", { bubbles: true }));
+          node.dispatchEvent(new Event("change", { bubbles: true }));
+        }).catch(() => {});
+        await snap("picker_selected_native_select", `Selected native option: ${optionData.text}`);
+        return true;
+      } catch {
+        /* try next select */
+      }
+    }
+    return false;
+  };
+
   const optionSelectors = [
     '.k-list-item',
     '.k-item',
@@ -282,17 +318,28 @@ async function loginAndPickAccount(
     .first();
 
   let optionClicked = false;
+  optionClicked = await selectSupplierFromNativeSelect();
+
   try {
-    await supplierOption.waitFor({ state: "visible", timeout: 7_000 });
-    await supplierOption.click({ timeout: 5_000 });
-    optionClicked = true;
+    if (!optionClicked) {
+      await supplierOption.waitFor({ state: "visible", timeout: 7_000 });
+      await supplierOption.click({ timeout: 5_000 });
+      optionClicked = true;
+    }
   } catch {
     try {
-      const supplierText = page.locator(`text=/^\\s*${ACCOUNT_LABEL}\\s*$/i`).first();
+      const supplierText = page.locator(`text=/\\b${ACCOUNT_LABEL}\\b/i`).first();
       await supplierText.click({ timeout: 5_000 });
       optionClicked = true;
     } catch {
-      /* fall through */
+      try {
+        await page.keyboard.press("ArrowDown");
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(500);
+        optionClicked = true;
+      } catch {
+        /* fall through */
+      }
     }
   }
 
@@ -346,7 +393,6 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
 
-  // --- Sanity check: still on login? ---
   const passStillVisible = await page
     .locator('input[type="password"]')
     .first()
@@ -354,9 +400,7 @@ async function loginAndPickAccount(
     .catch(() => false);
   const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
   const postLoginHint = await page
-    .locator(
-      '[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
-    )
+    .locator('[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i')
     .first()
     .isVisible()
     .catch(() => false);
