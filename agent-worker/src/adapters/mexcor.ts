@@ -2,6 +2,12 @@ import type { BrowserContext, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
+// Bump this whenever this adapter's login logic changes. It is written into
+// every preflight step so we can prove from the DB which build of the worker
+// actually ran. If a failed run does NOT show this version, the Railway
+// container is still on an older deploy — redeploy before debugging further.
+export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v3-enter-submit";
+
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
   "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
@@ -26,11 +32,22 @@ async function loginAndPickAccount(
     await uploadScreenshot(runId, page).catch(() => {});
     const screenshot_url = await uploadStepScreenshot(runId, page, preflightStep, label);
     await logStep(runId, preflightStep, "browser", {
-      output: { phase: label, message, url: page.url(), screenshot_url, ...extra },
+      output: {
+        phase: label,
+        message,
+        url: page.url(),
+        screenshot_url,
+        adapter_version: MEXCOR_ADAPTER_VERSION,
+        ...extra,
+      },
     }).catch(() => {});
   };
 
-  await setProgress(runId, "logging_in", "Opening Mexcor login page");
+  await setProgress(
+    runId,
+    "logging_in",
+    `Opening Mexcor login page (adapter ${MEXCOR_ADAPTER_VERSION})`,
+  );
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
@@ -56,7 +73,6 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
-    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -80,51 +96,93 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
-  // Encompass renders a hidden <input type="submit" class="HiddenSubmitButton"
-  // tabindex="10000"/> off-viewport as an Enter-key shim. We must exclude it
-  // and target the REAL visible Login button (or just press Enter, which is
-  // exactly what the shim is there to handle).
-  const loginCandidates = page.locator(
-    [
-      'button:has-text("Log in")',
-      'button:has-text("Login")',
-      'button:has-text("Sign in")',
-      'a:has-text("Log in")',
-      'a:has-text("Login")',
-      'input[type="submit"]:not(.HiddenSubmitButton):not([tabindex="10000"])',
-    ].join(", "),
-  );
-  let clicked = false;
-  const candidateCount = await loginCandidates.count();
-  for (let i = 0; i < candidateCount; i++) {
-    const cand = loginCandidates.nth(i);
-    if (await cand.isVisible().catch(() => false)) {
-      try {
-        await cand.click({ timeout: 5_000 });
-        clicked = true;
-        break;
-      } catch {
-        // try next candidate
+  const confirmBtnEarly = page.locator(
+    'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
+  ).first();
+  const passwordHidden = () =>
+    page.locator('input[type="password"]').first().waitFor({ state: "hidden", timeout: 15_000 });
+  const pickerVisible = () =>
+    confirmBtnEarly.waitFor({ state: "visible", timeout: 15_000 });
+  const urlChanged = () =>
+    page.waitForURL((u) => !u.toString().includes("DashboardID=100008"), { timeout: 15_000 });
+
+  const waitForSubmitOutcome = async () => {
+    await Promise.race([
+      pickerVisible().catch(() => {}),
+      passwordHidden().catch(() => {}),
+      urlChanged().catch(() => {}),
+    ]);
+    await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+  };
+
+  const strictSubmitSelector = [
+    'form:has(input[type="password"]) button[type="submit"]',
+    'form:has(input[type="password"]) input[type="submit"]:not(.HiddenSubmitButton):not([tabindex="10000"])',
+  ].join(", ");
+  const strictSubmitInitialCount = await page
+    .locator(strictSubmitSelector)
+    .count()
+    .catch(() => -1);
+
+  await passField.focus();
+  await passField.press("Enter");
+  let strategy = "pressed_enter";
+  await waitForSubmitOutcome();
+
+  const stillVisibleAfterEnter = await page
+    .locator('input[type="password"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  let clickedReal = false;
+  let strictMatched = 0;
+  if (stillVisibleAfterEnter) {
+    const strictSubmit = page.locator(strictSubmitSelector);
+    strictMatched = await strictSubmit.count().catch(() => 0);
+    for (let i = 0; i < strictMatched; i++) {
+      const cand = strictSubmit.nth(i);
+      if (await cand.isVisible().catch(() => false)) {
+        try {
+          await cand.click({ timeout: 5_000 });
+          clickedReal = true;
+          break;
+        } catch {
+          /* try next */
+        }
       }
     }
+    strategy = clickedReal ? "clicked_form_submit" : "none_found";
+    if (clickedReal) await waitForSubmitOutcome();
   }
-  if (!clicked) {
-    // Fall back to Enter on the password field — triggers the HiddenSubmitButton.
-    await passField.press("Enter");
-  }
-  await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-  await snap("submitted_login", clicked ? "Clicked visible Login button" : "Pressed Enter to submit form");
+
+  const passVisibleNow = await page
+    .locator('input[type="password"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  const pickerVisibleNow = await confirmBtnEarly.isVisible().catch(() => false);
+  const validationText = await page
+    .locator('text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i')
+    .first()
+    .innerText({ timeout: 1_000 })
+    .catch(() => "");
+
+  await snap("submitted_login", `strategy=${strategy}`, {
+    strategy,
+    strict_submit_initial_count: strictSubmitInitialCount,
+    strict_submit_matched_after_enter: strictMatched,
+    clicked_form_submit: clickedReal,
+    password_visible_after_submit: passVisibleNow,
+    picker_visible_after_submit: pickerVisibleNow,
+    validation_text: validationText ? validationText.slice(0, 200) : null,
+  });
 
   // --- Account picker (Vendors / Suppliers) ---
-  // Encompass renders this as a custom combobox: a visible trigger (showing the
-  // currently selected account like "Vendors (AP Contact)") that must be CLICKED
-  // to reveal the list of accounts. A hidden native <select> may also exist.
   const confirmBtn = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
 
-  // Detect the picker by looking for either the Confirm button OR a visible
-  // element containing "Vendors" / account text inside the Logon dialog.
   const sawPicker = await confirmBtn
     .waitFor({ state: "visible", timeout: 10_000 })
     .then(() => true)
@@ -133,7 +191,6 @@ async function loginAndPickAccount(
   if (sawPicker) {
     await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
 
-    // Strategy 1: try the native <select> path (in case Encompass serves a real select).
     const nativeSelect = page.locator(
       'select:has(option:text-matches("Suppliers|Vendors", "i"))',
     ).first();
@@ -145,18 +202,16 @@ async function loginAndPickAccount(
         });
         selected = true;
       } catch {
-        // fall through to combobox path
+        /* fall through */
       }
     }
 
-    // Strategy 2: custom combobox — click the visible trigger, then pick option.
     if (!selected) {
       const triggerCandidates = [
         '[role="combobox"]',
         'input[readonly]',
-        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap', // Kendo UI (common in Encompass)
+        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap',
         '.dropdown-toggle, [data-toggle="dropdown"]',
-        // last-ditch: any visible element in the dialog containing "Vendors"
         'text=/Vendors/i',
       ];
 
@@ -190,7 +245,6 @@ async function loginAndPickAccount(
         .filter({ has: page.locator(':scope:visible') })
         .first();
 
-      // Fallback locator if the :visible filter doesn't match
       const suppliersOptionLoose = page
         .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
         .filter({ hasNot: page.locator('button, [role="button"]') })
@@ -212,16 +266,28 @@ async function loginAndPickAccount(
     await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
 
-  // --- Sanity check: still on login? ---
-  const stillOnLogin = await page
+  // --- Soft sanity check ---
+  const passStillVisible = await page
     .locator('input[type="password"]')
     .first()
     .isVisible()
     .catch(() => false);
-  if (stillOnLogin) {
-    await snap("login_failed", "Password field still visible after submit");
+  const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
+  const postLoginHint = await page
+    .locator(
+      'button:has-text("Confirm"), [role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
+    )
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (passStillVisible && !urlLooksLoggedIn && !postLoginHint) {
+    await snap("login_failed", "Password field still visible and no post-login UI detected", {
+      url_looks_logged_in: urlLooksLoggedIn,
+      post_login_hint: postLoginHint,
+    });
     throw new Error(
-      "Mexcor login appears to have failed — still seeing a password field after submit. Check MEXCOR_USERNAME/MEXCOR_PASSWORD and MEXCOR_ACCOUNT_LABEL.",
+      `Mexcor login appears to have failed (adapter ${MEXCOR_ADAPTER_VERSION}) — still on the login form after submit. Check MEXCOR_USERNAME/MEXCOR_PASSWORD and MEXCOR_ACCOUNT_LABEL, or whether the Encompass page layout changed.`,
     );
   }
 
