@@ -2,13 +2,16 @@ import type { BrowserContext, Page } from "playwright";
 import { runLlmAgent } from "../agent/llmAgent.js";
 import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "../runHelpers.js";
 
-const LOGIN_URL =
-  process.env.MEXCOR_LOGIN_URL ||
-  "https://mexcor.encompass8.com/Home?DashboardID=100008&DestURL=Home%3FDashboardID%3D167349%26%26";
-const ACCOUNT_LABEL = (process.env.MEXCOR_ACCOUNT_LABEL || "Suppliers").trim();
+const LOGIN_URL = "https://encompass8.com/User/Login";
+const ACCOUNT_LABEL = process.env.MEXCOR_ACCOUNT_LABEL || "Suppliers";
 
 export type MexcorResult = { filePath: string; filename: string };
 
+/**
+ * Deterministically log into Encompass8 / Mexcor and pick the right account.
+ * Each phase logs a preflight step with a screenshot so the UI shows a
+ * thumbnail strip of where login broke (if it did).
+ */
 async function loginAndPickAccount(
   page: Page,
   username: string,
@@ -30,7 +33,8 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
-  // --- Username field ---
+  // --- Find username field. Try named selectors first, then fall back to the
+  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -50,6 +54,7 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
+    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -62,117 +67,131 @@ async function loginAndPickAccount(
 
   if (!visible) {
     await snap("login_form_missing", "Could not find a username input on the page");
-    throw new Error("Mexcor login form did not appear (no username input found).");
-  }
-
-  // Use pressSequentially so React-controlled inputs (with eye toggles) reliably
-  // receive each keystroke — .fill() can be swallowed by some custom inputs.
-  await userField.click();
-  await userField.fill("");
-  await userField.pressSequentially(username, { delay: 25 });
-
-  const passField = page.locator('input[type="password"]').first();
-  await passField.waitFor({ state: "visible", timeout: 15_000 });
-  await passField.click();
-  await passField.fill("");
-  await passField.pressSequentially(password, { delay: 25 });
-
-  // Read back what actually landed in the inputs (lengths only — never values).
-  const userVal = (await userField.inputValue().catch(() => "")) || "";
-  const passVal = (await passField.inputValue().catch(() => "")) || "";
-
-  await snap("credentials_filled", "Filled username + password", {
-    username_length_env: username.length,
-    username_length_in_field: userVal.length,
-    username_matches: userVal === username,
-    password_length_env: password.length,
-    password_length_in_field: passVal.length,
-    password_matches_length: passVal.length === password.length,
-  });
-
-  // --- Submit: click the visible Log in button first, Enter as fallback. ---
-  const loginBtn = page.locator(
-    [
-      'button:visible:has-text("Log in")',
-      'button:visible:has-text("Login")',
-      'button:visible:has-text("Sign in")',
-      'input[type="submit"]:visible:not(.HiddenSubmitButton)',
-      'input[type="button"][value*="Log" i]:visible',
-    ].join(", "),
-  ).first();
-
-  let clicked = false;
-  if (await loginBtn.count()) {
-    try {
-      await loginBtn.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => {});
-      await loginBtn.click({ timeout: 10_000 });
-      clicked = true;
-    } catch {
-      clicked = false;
-    }
-  }
-  if (!clicked) {
-    await passField.press("Enter").catch(() => {});
-  }
-
-  // Give the server time to respond — wait for either navigation or the error banner.
-  await Promise.race([
-    page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {}),
-    page.waitForURL((u) => !/login/i.test(u.toString()), { timeout: 15_000 }).catch(() => {}),
-    page.waitForTimeout(6_000),
-  ]);
-  await snap("submitted_login", "Submitted login form");
-
-  // --- Detect Encompass8's own "Invalid UserName/Email or password" banner ---
-  const errBanner = page.locator(
-    'text=/Invalid\\s+UserName|Invalid\\s+Username|Invalid\\s+Email|invalid\\s+password/i',
-  ).first();
-  if (await errBanner.isVisible().catch(() => false)) {
-    await snap("login_rejected", "Encompass8 returned 'Invalid UserName/Email or password'");
     throw new Error(
-      "Mexcor rejected the credentials. Check Railway: MEXCOR_USERNAME / MEXCOR_PASSWORD may have trailing whitespace, or the password was reset on Encompass (it warns 'same on all Encompass systems'). The credentials_filled step logs the lengths we filled — compare those to what you set in Railway.",
+      "Mexcor login form did not appear (no username input found). Check screenshots — the page may be showing a maintenance page, captcha, or has changed structure.",
     );
   }
 
-  // --- Account picker (Vendors / Suppliers) ---
-  const pickerSelect = page.locator(
-    'select:has(option:text-matches("Suppliers|Vendors", "i"))',
+  await userField.fill(username);
+  const passField = page.locator('input[type="password"]').first();
+  await passField.waitFor({ state: "visible", timeout: 15_000 });
+  await passField.fill(password);
+  await snap("credentials_filled", "Filled username + password");
+
+  const loginBtn = page.locator(
+    [
+      'button:has-text("Log in")',
+      'button:has-text("Login")',
+      'button:has-text("Sign in")',
+      'input[type="submit"]',
+    ].join(", "),
   ).first();
+  if (await loginBtn.count()) {
+    await loginBtn.click({ timeout: 10_000 });
+  } else {
+    await passField.press("Enter");
+  }
+  await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+  await snap("submitted_login", "Submitted login form");
+
+  // --- Account picker (Vendors / Suppliers) ---
+  // Encompass renders this as a custom combobox: a visible trigger (showing the
+  // currently selected account like "Vendors (AP Contact)") that must be CLICKED
+  // to reveal the list of accounts. A hidden native <select> may also exist.
   const confirmBtn = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
 
-  const sawPicker = await pickerSelect
-    .waitFor({ state: "visible", timeout: 8_000 })
+  // Detect the picker by looking for either the Confirm button OR a visible
+  // element containing "Vendors" / account text inside the Logon dialog.
+  const sawPicker = await confirmBtn
+    .waitFor({ state: "visible", timeout: 10_000 })
     .then(() => true)
     .catch(() => false);
 
   if (sawPicker) {
     await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
-    try {
-      await pickerSelect.selectOption({ label: ACCOUNT_LABEL }, { timeout: 5_000 });
-    } catch {
+
+    // Strategy 1: try the native <select> path (in case Encompass serves a real select).
+    const nativeSelect = page.locator(
+      'select:has(option:text-matches("Suppliers|Vendors", "i"))',
+    ).first();
+    let selected = false;
+    if (await nativeSelect.count()) {
       try {
-        await pickerSelect.selectOption(
-          { label: new RegExp(ACCOUNT_LABEL, "i") } as any,
-          { timeout: 5_000 },
-        );
+        await nativeSelect.selectOption({ label: new RegExp(ACCOUNT_LABEL, "i") } as any, {
+          timeout: 3_000,
+        });
+        selected = true;
       } catch {
-        await pickerSelect.click({ timeout: 5_000 }).catch(() => {});
-        const opt = page
-          .locator(`option, li, [role="option"]`)
-          .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
-          .first();
-        await opt.click({ timeout: 5_000 });
+        // fall through to combobox path
       }
     }
+
+    // Strategy 2: custom combobox — click the visible trigger, then pick option.
+    if (!selected) {
+      const triggerCandidates = [
+        '[role="combobox"]',
+        'input[readonly]',
+        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap', // Kendo UI (common in Encompass)
+        '.dropdown-toggle, [data-toggle="dropdown"]',
+        // last-ditch: any visible element in the dialog containing "Vendors"
+        'text=/Vendors/i',
+      ];
+
+      let triggerClicked = false;
+      for (const sel of triggerCandidates) {
+        const trig = page.locator(sel).first();
+        if (await trig.isVisible().catch(() => false)) {
+          try {
+            await trig.click({ timeout: 3_000 });
+            triggerClicked = true;
+            break;
+          } catch {
+            /* try next */
+          }
+        }
+      }
+
+      if (!triggerClicked) {
+        await snap("picker_trigger_missing", "Could not find a visible combobox trigger");
+        throw new Error(
+          "Could not open Mexcor account picker — no visible trigger found. See screenshot.",
+        );
+      }
+
+      await page.waitForTimeout(500);
+      await snap("picker_opened", "Clicked picker trigger — looking for Suppliers option");
+
+      const suppliersOption = page
+        .locator('[role="option"], li, .k-list-item, .dropdown-item, option')
+        .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
+        .filter({ has: page.locator(':scope:visible') })
+        .first();
+
+      // Fallback locator if the :visible filter doesn't match
+      const suppliersOptionLoose = page
+        .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
+        .filter({ hasNot: page.locator('button, [role="button"]') })
+        .first();
+
+      try {
+        await suppliersOption.waitFor({ state: "visible", timeout: 5_000 });
+        await suppliersOption.click({ timeout: 5_000 });
+      } catch {
+        await suppliersOptionLoose.click({ timeout: 5_000 });
+      }
+      await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
+    }
+
     await confirmBtn.waitFor({ state: "visible", timeout: 10_000 });
     await confirmBtn.click({ timeout: 10_000 });
-    await pickerSelect.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
+    await confirmBtn.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
     await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
 
+  // --- Sanity check: still on login? ---
   const stillOnLogin = await page
     .locator('input[type="password"]')
     .first()
@@ -181,7 +200,7 @@ async function loginAndPickAccount(
   if (stillOnLogin) {
     await snap("login_failed", "Password field still visible after submit");
     throw new Error(
-      "Mexcor login appears to have failed — still seeing a password field after submit.",
+      "Mexcor login appears to have failed — still seeing a password field after submit. Check MEXCOR_USERNAME/MEXCOR_PASSWORD and MEXCOR_ACCOUNT_LABEL.",
     );
   }
 
@@ -195,9 +214,8 @@ export async function runMexcor(
   runId: string,
   learnings: { question: string; answer: string }[],
 ): Promise<MexcorResult> {
-  // Trim env vars — pasting into Railway often grabs trailing whitespace/newlines.
-  const username = (process.env.MEXCOR_USERNAME || "").trim();
-  const password = (process.env.MEXCOR_PASSWORD || "").trim();
+  const username = process.env.MEXCOR_USERNAME;
+  const password = process.env.MEXCOR_PASSWORD;
   if (!username || !password) {
     throw new Error("MEXCOR_USERNAME / MEXCOR_PASSWORD missing on worker");
   }
@@ -206,14 +224,14 @@ export async function runMexcor(
   page.setDefaultTimeout(30_000);
   const lastPreflightStep = await loginAndPickAccount(page, username, password, runId);
 
-  const goal = `You are already logged into the Mexcor / Encompass8 supplier portal as the "${ACCOUNT_LABEL}" account. Do NOT try to log in again.
+  const goal = `You are already logged into the Mexcor / Encompass8 supplier portal as the "${ACCOUNT_LABEL}" account. Do NOT try to log in again — the username/password fields will not appear, and if they do, it means the session was lost (call ask_human instead of refilling).
 
 Your only job: find the latest sales report and download it as XLSX.
 
 Steps:
-1. Use the left sidebar — look for "Sales Execution", "Order Management", "Sales", "Reports", or "Sales Report".
-2. Open the most recent / current period report (use defaults if asked for a date range).
-3. Click Export / Download / Excel / XLSX. The download is captured automatically — call download_complete right after.`;
+1. Navigate using the left sidebar / top menu. Look for items like "Sales", "Sales Comparison", "Reports", "Sales Report", or "Order Management".
+2. Open the most recent / current period report (use defaults if a date range is requested).
+3. Find an export action (Export, Download, Excel, XLSX) and click it. The download will be captured automatically — call download_complete right after you trigger it.`;
 
   return runLlmAgent({
     context,
