@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v3-enter-submit";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v4-picker-required";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -96,6 +96,9 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
+  // Encompass's canonical submit path is the HiddenSubmitButton shim wired to
+  // Enter in the password field. Press Enter first, then fall back to a STRICT
+  // form-scoped submit button.
   const confirmBtnEarly = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
@@ -179,18 +182,42 @@ async function loginAndPickAccount(
   });
 
   // --- Account picker (Vendors / Suppliers) ---
+  // Encompass renders a Kendo dialog ("Logon") with a custom combobox showing
+  // the currently selected account. We MUST click the combobox to open the
+  // list, pick Suppliers, then click Confirm. Skipping this leaves the worker
+  // authenticated as the wrong account.
   const confirmBtn = page.locator(
-    'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
+    [
+      'input[type="submit"][value="Confirm" i]',
+      'button:has-text("Confirm")',
+      '.k-window:has-text("Logon") button:has-text("Confirm")',
+    ].join(", "),
   ).first();
 
-  const sawPicker = await confirmBtn
-    .waitFor({ state: "visible", timeout: 10_000 })
+  const pickerDetector = page.locator(
+    [
+      'input[type="submit"][value="Confirm" i]',
+      'button:has-text("Confirm")',
+      '.k-window-title:has-text("Logon")',
+      'text=/multiple accounts on this site/i',
+    ].join(", "),
+  ).first();
+
+  const sawPicker = await pickerDetector
+    .waitFor({ state: "visible", timeout: 15_000 })
     .then(() => true)
     .catch(() => false);
 
-  if (sawPicker) {
-    await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
+  if (!sawPicker) {
+    await snap("account_picker_skipped", "No account picker detected after login", {
+      picker_present: false,
+    });
+  } else {
+    await snap("account_picker_detected", `Account picker visible — selecting ${ACCOUNT_LABEL}`, {
+      picker_present: true,
+    });
 
+    // Strategy 1: native <select>
     const nativeSelect = page.locator(
       'select:has(option:text-matches("Suppliers|Vendors", "i"))',
     ).first();
@@ -206,13 +233,20 @@ async function loginAndPickAccount(
       }
     }
 
+    // Strategy 2: Kendo / custom combobox
     if (!selected) {
       const triggerCandidates = [
+        '.k-window:has-text("Logon") .k-dropdown-wrap',
+        '.k-window:has-text("Logon") .k-dropdownlist',
+        '.k-window:has-text("Logon") [aria-haspopup="listbox"]',
+        '.k-window:has-text("Logon") [role="combobox"]',
+        '.k-window:has-text("Logon") input[readonly]',
+        '.k-dropdown-wrap',
+        '.k-dropdownlist',
+        '[aria-haspopup="listbox"]',
         '[role="combobox"]',
         'input[readonly]',
-        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap',
         '.dropdown-toggle, [data-toggle="dropdown"]',
-        'text=/Vendors/i',
       ];
 
       let triggerClicked = false;
@@ -232,41 +266,70 @@ async function loginAndPickAccount(
       if (!triggerClicked) {
         await snap("picker_trigger_missing", "Could not find a visible combobox trigger");
         throw new Error(
-          "Could not open Mexcor account picker — no visible trigger found. See screenshot.",
+          "Mexcor account picker: no visible dropdown trigger found inside the Logon dialog.",
         );
       }
 
       await page.waitForTimeout(500);
-      await snap("picker_opened", "Clicked picker trigger — looking for Suppliers option");
+      await snap("picker_opened", `Clicked picker trigger — looking for ${ACCOUNT_LABEL} option`);
 
-      const suppliersOption = page
-        .locator('[role="option"], li, .k-list-item, .dropdown-item, option')
+      const optionSelectors = [
+        '.k-list-item',
+        '.k-item',
+        'li[role="option"]',
+        '[role="option"]',
+        '.dropdown-item',
+        'li',
+        'option',
+      ].join(", ");
+
+      const supplierOption = page
+        .locator(optionSelectors)
         .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
-        .filter({ has: page.locator(':scope:visible') })
         .first();
 
-      const suppliersOptionLoose = page
-        .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
-        .filter({ hasNot: page.locator('button, [role="button"]') })
-        .first();
-
+      let optionClicked = false;
       try {
-        await suppliersOption.waitFor({ state: "visible", timeout: 5_000 });
-        await suppliersOption.click({ timeout: 5_000 });
+        await supplierOption.waitFor({ state: "visible", timeout: 5_000 });
+        await supplierOption.click({ timeout: 5_000 });
+        optionClicked = true;
       } catch {
-        await suppliersOptionLoose.click({ timeout: 5_000 });
+        try {
+          await page
+            .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
+            .filter({ hasNot: page.locator('button, [role="button"], input') })
+            .first()
+            .click({ timeout: 5_000 });
+          optionClicked = true;
+        } catch {
+          /* fail below */
+        }
       }
+
+      if (!optionClicked) {
+        await snap("picker_option_missing", `Could not click ${ACCOUNT_LABEL} option in dropdown`);
+        throw new Error(
+          `Mexcor account picker: ${ACCOUNT_LABEL} option not found / not clickable in dropdown.`,
+        );
+      }
+
       await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
     }
 
-    await confirmBtn.waitFor({ state: "visible", timeout: 10_000 });
-    await confirmBtn.click({ timeout: 10_000 });
+    // Click Confirm and wait for the dialog to close.
+    try {
+      await confirmBtn.waitFor({ state: "visible", timeout: 10_000 });
+      await confirmBtn.click({ timeout: 10_000 });
+    } catch (err) {
+      await snap("confirm_click_failed", `Failed to click Confirm: ${(err as Error).message}`);
+      throw new Error("Mexcor account picker: failed to click Confirm button.");
+    }
     await confirmBtn.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
     await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
 
-  // --- Soft sanity check ---
+  // --- Sanity check: still on login? ---
   const passStillVisible = await page
     .locator('input[type="password"]')
     .first()
@@ -275,7 +338,7 @@ async function loginAndPickAccount(
   const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
   const postLoginHint = await page
     .locator(
-      'button:has-text("Confirm"), [role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
+      '[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
     )
     .first()
     .isVisible()
