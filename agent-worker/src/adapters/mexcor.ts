@@ -35,6 +35,8 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
+  // --- Find username field. Try named selectors first, then fall back to the
+  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -54,6 +56,7 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
+    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -76,14 +79,6 @@ async function loginAndPickAccount(
   await passField.waitFor({ state: "visible", timeout: 15_000 });
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
-
-Thought for 7s
-The URL fix worked — page loads, credentials fill. The new failure is a different problem:
-
-Root cause: Playwright's login-button selector resolved to <input type="submit" class="HiddenSubmitButton" tabindex="10000"/> — Encompass renders a hidden form-submit shim that sits off-viewport. Playwright keeps retrying to scroll/click it for 10s and times out. The real visible "Login" button is a different element that our selector list never reaches because input[type="submit"] matches the hidden one first.
-
-Fixed Encompass login timeout
-Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block (lines 83–116):
 
   // Encompass renders a hidden <input type="submit" class="HiddenSubmitButton"
   // tabindex="10000"/> off-viewport as an Enter-key shim. We must exclude it
@@ -120,6 +115,25 @@ Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block 
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("submitted_login", clicked ? "Clicked visible Login button" : "Pressed Enter to submit form");
 
+  // --- Account picker (Vendors / Suppliers) ---
+  // Encompass renders this as a custom combobox: a visible trigger (showing the
+  // currently selected account like "Vendors (AP Contact)") that must be CLICKED
+  // to reveal the list of accounts. A hidden native <select> may also exist.
+  const confirmBtn = page.locator(
+    'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
+  ).first();
+
+  // Detect the picker by looking for either the Confirm button OR a visible
+  // element containing "Vendors" / account text inside the Logon dialog.
+  const sawPicker = await confirmBtn
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (sawPicker) {
+    await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
+
+    // Strategy 1: try the native <select> path (in case Encompass serves a real select).
     const nativeSelect = page.locator(
       'select:has(option:text-matches("Suppliers|Vendors", "i"))',
     ).first();
@@ -131,16 +145,18 @@ Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block 
         });
         selected = true;
       } catch {
-        // fall through
+        // fall through to combobox path
       }
     }
 
+    // Strategy 2: custom combobox — click the visible trigger, then pick option.
     if (!selected) {
       const triggerCandidates = [
         '[role="combobox"]',
         'input[readonly]',
-        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap',
+        'div.k-dropdown, span.k-dropdown, span.k-dropdown-wrap', // Kendo UI (common in Encompass)
         '.dropdown-toggle, [data-toggle="dropdown"]',
+        // last-ditch: any visible element in the dialog containing "Vendors"
         'text=/Vendors/i',
       ];
 
@@ -174,6 +190,7 @@ Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block 
         .filter({ has: page.locator(':scope:visible') })
         .first();
 
+      // Fallback locator if the :visible filter doesn't match
       const suppliersOptionLoose = page
         .locator(`:visible:has-text("${ACCOUNT_LABEL}")`)
         .filter({ hasNot: page.locator('button, [role="button"]') })
@@ -195,6 +212,7 @@ Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block 
     await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
   }
 
+  // --- Sanity check: still on login? ---
   const stillOnLogin = await page
     .locator('input[type="password"]')
     .first()
