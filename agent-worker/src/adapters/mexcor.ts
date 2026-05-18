@@ -77,34 +77,48 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
-  const loginBtn = page.locator(
+Thought for 7s
+The URL fix worked — page loads, credentials fill. The new failure is a different problem:
+
+Root cause: Playwright's login-button selector resolved to <input type="submit" class="HiddenSubmitButton" tabindex="10000"/> — Encompass renders a hidden form-submit shim that sits off-viewport. Playwright keeps retrying to scroll/click it for 10s and times out. The real visible "Login" button is a different element that our selector list never reaches because input[type="submit"] matches the hidden one first.
+
+Fixed Encompass login timeout
+Done. Here's the updated agent-worker/src/adapters/mexcor.ts login-submit block (lines 83–116):
+
+  // Encompass renders a hidden <input type="submit" class="HiddenSubmitButton"
+  // tabindex="10000"/> off-viewport as an Enter-key shim. We must exclude it
+  // and target the REAL visible Login button (or just press Enter, which is
+  // exactly what the shim is there to handle).
+  const loginCandidates = page.locator(
     [
       'button:has-text("Log in")',
       'button:has-text("Login")',
       'button:has-text("Sign in")',
-      'input[type="submit"]',
+      'a:has-text("Log in")',
+      'a:has-text("Login")',
+      'input[type="submit"]:not(.HiddenSubmitButton):not([tabindex="10000"])',
     ].join(", "),
-  ).first();
-  if (await loginBtn.count()) {
-    await loginBtn.click({ timeout: 10_000 });
-  } else {
+  );
+  let clicked = false;
+  const candidateCount = await loginCandidates.count();
+  for (let i = 0; i < candidateCount; i++) {
+    const cand = loginCandidates.nth(i);
+    if (await cand.isVisible().catch(() => false)) {
+      try {
+        await cand.click({ timeout: 5_000 });
+        clicked = true;
+        break;
+      } catch {
+        // try next candidate
+      }
+    }
+  }
+  if (!clicked) {
+    // Fall back to Enter on the password field — triggers the HiddenSubmitButton.
     await passField.press("Enter");
   }
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
-  await snap("submitted_login", "Submitted login form");
-
-  // --- Account picker (Vendors / Suppliers) ---
-  const confirmBtn = page.locator(
-    'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
-  ).first();
-
-  const sawPicker = await confirmBtn
-    .waitFor({ state: "visible", timeout: 10_000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (sawPicker) {
-    await snap("account_picker", `Account picker visible — selecting ${ACCOUNT_LABEL}`);
+  await snap("submitted_login", clicked ? "Clicked visible Login button" : "Pressed Enter to submit form");
 
     const nativeSelect = page.locator(
       'select:has(option:text-matches("Suppliers|Vendors", "i"))',
