@@ -96,7 +96,7 @@ try {
 } catch {
   if (await loginBtn.count()) {
     await loginBtn.click({ timeout: 10_000 });
-  } else {
+ } } else {
     await passField.press("Enter");
   }
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
