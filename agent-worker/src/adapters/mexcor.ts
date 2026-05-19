@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-19.v10-dismiss-dropdown-before-confirm";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-19.v11-soft-verify-proceed-to-confirm";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -73,6 +73,7 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
+    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -96,6 +97,10 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
+  // Encompass's canonical submit path is the HiddenSubmitButton shim wired to
+  // Enter in the password field. Click selectors based on text (Login/Log in)
+  // tend to match unrelated elements on this page, so we press Enter first
+  // and only fall back to a STRICT form-scoped submit button.
   const confirmBtnEarly = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
@@ -121,6 +126,8 @@ async function loginAndPickAccount(
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
   };
 
+  // Count strict form-scoped submit candidates BEFORE we try anything, so the
+  // log can prove what was actually on the page.
   const strictSubmitSelector = [
     'form:has(input[type="password"]) button[type="submit"]',
     'form:has(input[type="password"]) input[type="submit"]:not(.HiddenSubmitButton):not([tabindex="10000"])',
@@ -162,6 +169,8 @@ async function loginAndPickAccount(
     if (clickedReal) await waitForSubmitOutcome();
   }
 
+  // Post-submit diagnostics — used both for logging and for the soft-fallback
+  // decision below. We DO NOT print the username/password anywhere.
   const passVisibleNow = await page
     .locator('input[type="password"]')
     .first()
@@ -186,7 +195,12 @@ async function loginAndPickAccount(
     validation_text: validationText ? validationText.slice(0, 200) : null,
   });
 
+
   // --- Account picker (Vendors -> Suppliers) ---
+  // After login, Encompass8 shows the CURRENTLY selected account in a Kendo
+  // combobox, e.g. "maxstrygler@ (Vendors (AP Contact))". There is NO visible
+  // dropdown list until we click that field. We poll the whole page for any
+  // element whose value/text matches "@... Vendors" and click it.
   const VENDORS_RE = /@.*vendors|vendors\s*\(/i;
 
   const findVendorsField = async (): Promise<Locator | null> => {
@@ -359,8 +373,10 @@ async function loginAndPickAccount(
   await snap("picker_selected", `Selected ${ACCOUNT_LABEL} from dropdown`);
 
   // The Kendo dropdown list overlays the Confirm button. Dismiss it by
-  // clicking neutral whitespace inside the Logon modal, pressing Escape/Tab,
-  // and waiting for the open listbox to disappear before searching for Confirm.
+  // clicking neutral whitespace inside the Logon modal (the dialog title bar
+  // or modal body), pressing Escape/Tab, and waiting for the open listbox
+  // (`.k-animation-container:visible`, `.k-list:visible`, `[role="listbox"]:visible`)
+  // to disappear before searching for Confirm.
   const dismissDropdown = async () => {
     const dismissTargets = [
       page.locator('.k-window-titlebar:visible, .k-dialog-titlebar:visible').first(),
@@ -389,25 +405,41 @@ async function loginAndPickAccount(
   await dismissDropdown();
   await snap("picker_dropdown_dismissed", "Dismissed open dropdown so Confirm becomes clickable");
 
-  const suppliersSelected = await page
-    .locator('input:visible, span:visible, div:visible, [role="combobox"]:visible, .k-input:visible, .k-input-inner:visible')
-    .filter({ hasText: new RegExp(ACCOUNT_LABEL, "i") })
-    .first()
-    .waitFor({ state: "visible", timeout: 5_000 })
-    .then(() => true)
-    .catch(async () => {
-      const inputs = page.locator('input:visible');
-      const count = await inputs.count().catch(() => 0);
-      for (let i = 0; i < count; i++) {
-        const value = await inputs.nth(i).inputValue().catch(() => "");
-        if (new RegExp(ACCOUNT_LABEL, "i").test(value)) return true;
-      }
-      return false;
-    });
+
+  // Soft verification — gather multiple selection signals but DO NOT fail if
+  // the visible field hasn't updated yet. Kendo often updates the underlying
+  // model before the visible text reflects the change. The real proof is
+  // whether Confirm closes the picker and the portal loads.
+  const selectionSignals = await page.evaluate((label) => {
+    const labelLc = String(label).toLowerCase();
+    const inField = Array.from(document.querySelectorAll<HTMLInputElement>('input'))
+      .some((i) => (i.value || '').toLowerCase().includes(labelLc));
+    const inText = Array.from(document.querySelectorAll('.k-input, .k-input-inner, [role="combobox"], span, div'))
+      .some((el) => ((el as HTMLElement).innerText || '').toLowerCase().includes(labelLc));
+    const ariaSelected = !!document.querySelector(
+      `[aria-selected="true"][class*="k-"], .k-selected, .k-list-item.k-selected`,
+    );
+    const nativeSelect = Array.from(document.querySelectorAll<HTMLSelectElement>('select'))
+      .some((s) => (s.selectedOptions?.[0]?.textContent || '').toLowerCase().includes(labelLc));
+    return { inField, inText, ariaSelected, nativeSelect };
+  }, ACCOUNT_LABEL).catch(() => ({ inField: false, inText: false, ariaSelected: false, nativeSelect: false }));
+
+  const suppliersSelected =
+    selectionSignals.inField ||
+    selectionSignals.inText ||
+    selectionSignals.ariaSelected ||
+    selectionSignals.nativeSelect;
 
   if (!suppliersSelected) {
-    await snap("picker_selection_unverified", `${ACCOUNT_LABEL} was clicked, but the account field did not visibly change`);
-    throw new Error(`Mexcor account picker: clicked ${ACCOUNT_LABEL}, but could not verify it was selected.`);
+    await snap(
+      "picker_selection_assumed",
+      `${ACCOUNT_LABEL} was clicked but no visible signal confirmed it — proceeding to Confirm anyway`,
+      { selection_signals: selectionSignals },
+    );
+  } else {
+    await snap("picker_selection_verified", `Detected ${ACCOUNT_LABEL} selection`, {
+      selection_signals: selectionSignals,
+    });
   }
 
   const confirmSelectors = [
@@ -431,6 +463,7 @@ async function loginAndPickAccount(
 
   let confirmBtn = await findVisibleConfirm();
   if (!confirmBtn) {
+    // Dropdown likely still overlaying Confirm — retry dismiss then look again.
     await dismissDropdown();
     confirmBtn = await findVisibleConfirm();
   }
@@ -439,6 +472,7 @@ async function loginAndPickAccount(
     await snap("confirm_button_missing", `${ACCOUNT_LABEL} selected, but Confirm button was not visible`);
     throw new Error("Mexcor account picker: Confirm button missing after selecting Suppliers account.");
   }
+
 
   try {
     await snap("confirming_account", `Clicking Confirm for ${ACCOUNT_LABEL} account`);
@@ -467,6 +501,9 @@ async function loginAndPickAccount(
   await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
 
   // --- Sanity check: still on login? ---
+  // Run AFTER the picker block so we don't false-positive while the dialog
+  // is still open. Only fail if password field is still visible AND there is
+  // no post-login UI signal.
   const passStillVisible = await page
     .locator('input[type="password"]')
     .first()
