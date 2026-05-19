@@ -6,7 +6,7 @@ import { logStep, setProgress, uploadScreenshot, uploadStepScreenshot } from "..
 // every preflight step so we can prove from the DB which build of the worker
 // actually ran. If a failed run does NOT show this version, the Railway
 // container is still on an older deploy — redeploy before debugging further.
-export const MEXCOR_ADAPTER_VERSION = "2026-05-18.v8-native-select-suppliers-row";
+export const MEXCOR_ADAPTER_VERSION = "2026-05-19.v9-mandatory-supplier-confirm";
 
 const LOGIN_URL =
   process.env.MEXCOR_LOGIN_URL ||
@@ -17,6 +17,8 @@ export type MexcorResult = { filePath: string; filename: string };
 
 /**
  * Deterministically log into Encompass8 / Mexcor and pick the right account.
+ * Each phase logs a preflight step with a screenshot so the UI shows a
+ * thumbnail strip of where login broke (if it did).
  */
 async function loginAndPickAccount(
   page: Page,
@@ -50,6 +52,8 @@ async function loginAndPickAccount(
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
   await snap("page_loaded", `Loaded ${page.url()}`);
 
+  // --- Find username field. Try named selectors first, then fall back to the
+  // first visible non-password text input on the page. ---
   const namedSelectors = [
     'input[name="UserName"]',
     'input[name="Username"]',
@@ -69,6 +73,7 @@ async function loginAndPickAccount(
     .catch(() => false);
 
   if (!visible) {
+    // Fallback: first visible text-like input that is NOT a password field.
     const fallback = page.locator(
       'input:visible:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
     ).first();
@@ -82,7 +87,7 @@ async function loginAndPickAccount(
   if (!visible) {
     await snap("login_form_missing", "Could not find a username input on the page");
     throw new Error(
-      "Mexcor login form did not appear (no username input found).",
+      "Mexcor login form did not appear (no username input found). Check screenshots — the page may be showing a maintenance page, captcha, or has changed structure.",
     );
   }
 
@@ -92,6 +97,10 @@ async function loginAndPickAccount(
   await passField.fill(password);
   await snap("credentials_filled", "Filled username + password");
 
+  // Encompass's canonical submit path is the HiddenSubmitButton shim wired to
+  // Enter in the password field. Click selectors based on text (Login/Log in)
+  // tend to match unrelated elements on this page, so we press Enter first
+  // and only fall back to a STRICT form-scoped submit button.
   const confirmBtnEarly = page.locator(
     'button:has-text("Confirm"), input[type="submit"][value*="Confirm" i]',
   ).first();
@@ -117,6 +126,8 @@ async function loginAndPickAccount(
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
   };
 
+  // Count strict form-scoped submit candidates BEFORE we try anything, so the
+  // log can prove what was actually on the page.
   const strictSubmitSelector = [
     'form:has(input[type="password"]) button[type="submit"]',
     'form:has(input[type="password"]) input[type="submit"]:not(.HiddenSubmitButton):not([tabindex="10000"])',
@@ -158,6 +169,8 @@ async function loginAndPickAccount(
     if (clickedReal) await waitForSubmitOutcome();
   }
 
+  // Post-submit diagnostics — used both for logging and for the soft-fallback
+  // decision below. We DO NOT print the username/password anywhere.
   const passVisibleNow = await page
     .locator('input[type="password"]')
     .first()
@@ -165,7 +178,9 @@ async function loginAndPickAccount(
     .catch(() => false);
   const pickerVisibleNow = await confirmBtnEarly.isVisible().catch(() => false);
   const validationText = await page
-    .locator('text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i')
+    .locator(
+      'text=/invalid|incorrect|locked|disabled|too many|wrong|failed|error/i',
+    )
     .first()
     .innerText({ timeout: 1_000 })
     .catch(() => "");
@@ -180,7 +195,12 @@ async function loginAndPickAccount(
     validation_text: validationText ? validationText.slice(0, 200) : null,
   });
 
+
   // --- Account picker (Vendors -> Suppliers) ---
+  // After login, Encompass8 shows the CURRENTLY selected account in a Kendo
+  // combobox, e.g. "maxstrygler@ (Vendors (AP Contact))". There is NO visible
+  // dropdown list until we click that field. We poll the whole page for any
+  // element whose value/text matches "@... Vendors" and click it.
   const VENDORS_RE = /@.*vendors|vendors\s*\(/i;
 
   const findVendorsField = async (): Promise<Locator | null> => {
@@ -373,26 +393,61 @@ async function loginAndPickAccount(
     throw new Error(`Mexcor account picker: clicked ${ACCOUNT_LABEL}, but could not verify it was selected.`);
   }
 
-  const confirmBtn = page.locator(
-    [
-      'input[type="submit"][value="Confirm" i]',
-      'button:has-text("Confirm")',
-      '.k-window:has-text("Logon") button:has-text("Confirm")',
-    ].join(", "),
-  ).first();
+  const confirmSelectors = [
+    'input[type="submit"][value*="Confirm" i]',
+    'input[type="button"][value*="Confirm" i]',
+    'button:has-text("Confirm")',
+    '.k-button:has-text("Confirm")',
+    '[role="button"]:has-text("Confirm")',
+    'a:has-text("Confirm")',
+  ].join(", ");
 
-  if (await confirmBtn.isVisible().catch(() => false)) {
-    try {
-      await confirmBtn.click({ timeout: 10_000 });
-      await confirmBtn.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
-    } catch (err) {
-      await snap("confirm_click_failed", `Failed to click Confirm: ${(err as Error).message}`);
-      throw new Error("Mexcor account picker: failed to click Confirm button.");
+  const confirmButtons = page.locator(confirmSelectors);
+  let confirmBtn: Locator | null = null;
+  const confirmCount = await confirmButtons.count().catch(() => 0);
+  for (let i = 0; i < confirmCount; i++) {
+    const candidate = confirmButtons.nth(i);
+    if (await candidate.isVisible().catch(() => false)) {
+      confirmBtn = candidate;
+      break;
     }
   }
+
+  if (!confirmBtn) {
+    await snap("confirm_button_missing", `${ACCOUNT_LABEL} selected, but Confirm button was not visible`);
+    throw new Error("Mexcor account picker: Confirm button missing after selecting Suppliers account.");
+  }
+
+  try {
+    await snap("confirming_account", `Clicking Confirm for ${ACCOUNT_LABEL} account`);
+    await confirmBtn.click({ timeout: 10_000 });
+    await page.waitForTimeout(750);
+    if (await confirmBtn.isVisible().catch(() => false)) {
+      await confirmBtn.evaluate((node: HTMLElement) => node.click()).catch(() => {});
+    }
+  } catch (err) {
+    await snap("confirm_click_failed", `Failed to click Confirm: ${(err as Error).message}`);
+    throw new Error("Mexcor account picker: failed to click Confirm button.");
+  }
   await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+
+  const pickerStillOpen = await page
+    .locator('.k-window:has-text("Logon"), text=/multiple accounts on this site/i')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (pickerStillOpen || (await confirmBtn.isVisible().catch(() => false))) {
+    await snap("confirm_not_completed", "Confirm was clicked, but the account picker is still visible");
+    throw new Error("Mexcor account picker: Confirm did not complete; refusing to start the LLM before entering the portal.");
+  }
+
   await snap("account_confirmed", `Confirmed ${ACCOUNT_LABEL} account`);
 
+  // --- Sanity check: still on login? ---
+  // Run AFTER the picker block so we don't false-positive while the dialog
+  // is still open. Only fail if password field is still visible AND there is
+  // no post-login UI signal.
   const passStillVisible = await page
     .locator('input[type="password"]')
     .first()
@@ -400,7 +455,9 @@ async function loginAndPickAccount(
     .catch(() => false);
   const urlLooksLoggedIn = !page.url().includes("DashboardID=100008");
   const postLoginHint = await page
-    .locator('[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i')
+    .locator(
+      '[role="navigation"], nav, aside, [class*="dashboard" i], text=/Sales|Order Management|Reports/i',
+    )
     .first()
     .isVisible()
     .catch(() => false);
